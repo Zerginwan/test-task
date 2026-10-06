@@ -1,0 +1,1291 @@
+## В этом файле запрещены джобы без точки в начале!
+include:
+  - local: namespaces.yml
+
+workflow:
+  name: "${CI_COMMIT_TITLE} @$NS.$CLUSTER"
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "push"
+      when: never 
+    - when: always
+
+stages:
+  - prepare
+  - checks
+  - build
+  - download
+  - tests
+  - e2e-tests
+  - push
+  - deploy
+
+default:
+  tags:
+    - build-docker
+  image: ${HELM_IMAGE}
+  interruptible: true
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - unknown_failure
+
+variables:
+  IS_DEVELOP_ENVIRONMENT: "true"
+  APP: "$CI_PROJECT_NAME"
+  DOCKER_DRIVER: overlay2
+  DOCKER_DIND_IMAGE: ${NEXUS_URL}/docker:26.0-dind
+  DNS_CHANGE_FILE: dns_on_dev.yaml
+  DNS_DEV_ZONE: dev.nextbi.ru
+  FORCE_REBUILD: "false"
+  GITLAB_CI_DOTENV_FILE: ci.env
+  HELM_CLONE_REPO_ID: "182"
+  HELM_CLONE_REPO_REF: ${DEFAULT_DEPLOY_REPO_REF} # develop -> develop
+  HELM_CLONE_REPO_TARGET_DIR: ./chart
+  HELM_IMAGE: ${NEXUS_URL}/deploy/helm-kubectl:3.16
+  HELM_REGISTRY_URL: https://nexus.nextbi.ru/repository/helm/
+  HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE: "true"
+  HELM_TIMEOUT: "10"
+  JAVA_VERSION: "21" # "21"
+  GRADLE_VERSION: "8.14.0"
+  JAVA_VERSION_KEYWORD: "libVersion"
+  JAVA_VERSION_FILE: "gradle.properties"
+  NEXUS_URL: "nexus.nextbi.ru:8103"
+  NODE_JS_IMAGE: "${NEXUS_URL}/node/node:22-bookworm-slim"
+  RANCHER_URL: https://rancher.dev.nextbi.ru
+  TZ: "Europe/Moscow"
+  REGISTRY_IMAGE: ${NEXUS_URL}/nextbi
+  SSH_ID_RSA: ${CI_PROJECT_DIR}/ssh_id_rsa
+  UPDATE_SERVICE_URL: https://update-repository.k8s-dev.nextbi.ru
+  UPDATE_SERVICE_URL_COMPONENTS: ${UPDATE_SERVICE_URL}/update-repository/api/v1/components
+  VALUE_FILE: ${CI_PROJECT_DIR}/k8s/values/values.yaml
+  VERSION_MAJOR: "0"
+  VERSION_MINOR: "0"
+  # ANSI-цвета
+  RED: "\e[31m"
+  GREEN: "\e[32m"
+  YELLOW: "\e[33m"
+  BLUE: "\e[34m"
+  CYAN: "\e[36m"
+  MAGENTA: "\e[35m"
+  CLEAR: "\e[0m"
+
+.templates:
+  #@build_dockerfile_from_template
+  # Скачивает из deploy misc/Dockerfile.tpl, подставляет значения из .gitlab/docker-template-values.yaml, генерирует ./Dockerfile
+  # Если в репозитории уже есть Dockerfile.tpl, то не заменяет его
+  # Требует: jq, curl
+  build_dockerfile_from_template:
+    - !reference [.templates, gotpl_download]
+    - |
+      export DOWNLOAD_FILE_FROM_GITLAB_TARGET_PATH=${CI_PROJECT_DIR}/Dockerfile.tpl.tmp
+      export DOWNLOAD_FILE_FROM_GITLAB_PROJECT_ID=183
+      export DOWNLOAD_FILE_FROM_GITLAB_PATH_IN_PROJECT=misc/Dockerfile.tpl
+      export DOWNLOAD_FILE_FROM_GITLAB_REF=${DEFAULT_DEPLOY_REPO_REF}
+      export DOWNLOAD_FILE_FROM_GITLAB_USE_DEFAULT_BRANCH_ON_MISS=true
+    - !reference [.templates, download_file_from_gitlab]
+    - |
+      echo "Преобразовываем Dockerfile.tpl в Dockerfile"
+      [[ ! -f ${CI_PROJECT_DIR}/Dockerfile.tpl ]] && mv Dockerfile.tpl.tmp Dockerfile.tpl || echo "Нашли родной Dockerfile.tpl, используем его"
+      [[ ! -f ${CI_PROJECT_DIR}/.gitlab/docker-template-values.yaml ]] && mkdir -p ${CI_PROJECT_DIR}/.gitlab && touch ${CI_PROJECT_DIR}/.gitlab/docker-template-values.yaml || true
+      ./gotpl Dockerfile.tpl -f .gitlab/docker-template-values.yaml  > Dockerfile
+
+  #@calc_version_job
+  # подсчитываем версию из коммита или тега, если VERSION не задана
+  # Иногда требует VERSION_MAJOR, VERSION_MINOR
+  # Vars: VERSION, VERSION_NUM, VERSION_HASH, VERSION_MAJOR, VERSION_MINOR
+  calc_version_job:
+    - |
+      export VERSION_HASH="${CI_COMMIT_SHORT_SHA}" ;
+      if [[ -z ${CI_COMMIT_TAG} ]]; then
+        git fetch origin || (apk add git || apt update -q && apt install git -y -q ) && git fetch origin || true ; 
+        export VERSION_NUM="${VERSION_MAJOR}.${VERSION_MINOR}.`git rev-list --count origin/${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-${CI_COMMIT_BRANCH}}`" ;
+
+        COUNT="$(git rev-list --count origin/${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-${CI_COMMIT_BRANCH}} || git rev-list --count HEAD)"
+        export VERSION_NUM="${VERSION_MAJOR}.${VERSION_MINOR}.${COUNT}"
+        if [[ -z ${VERSION} ]] ; then
+          export VERSION="$VERSION_NUM.$VERSION_HASH-${CI_COMMIT_REF_SLUG}" ;
+          export VERSION_SAFE="${VERSION_MAJOR}.${VERSION_MINOR}.${CI_PIPELINE_ID}.$VERSION_HASH-${CI_COMMIT_REF_SLUG}" ;
+        fi ;
+      elif [[ "${CI_COMMIT_TAG}" == "develop-tag" ]] ; then
+        VERSION_NUM=0.0.1
+        if [[ -z ${VERSION} ]] ; then
+          export VERSION="$VERSION_NUM.$VERSION_HASH-${CI_COMMIT_REF_SLUG}" ;
+          export VERSION_SAFE="${VERSION_MAJOR}.${VERSION_MINOR}.${CI_PIPELINE_ID}.$VERSION_HASH-${CI_COMMIT_REF_SLUG}" ;
+        fi ;
+      else
+        export VERSION_NUM=${CI_COMMIT_TAG} ;
+        if [[ -z ${VERSION} ]] ; then
+          export VERSION="${CI_COMMIT_TAG}" ;
+          export VERSION_SAFE="${VERSION_MAJOR}.${VERSION_MINOR}.${CI_PIPELINE_ID}.$VERSION_HASH-${CI_COMMIT_REF_SLUG}" ;
+        fi ;
+      fi ;
+      VERSION="${VERSION:0:60}";
+      VERSION="${VERSION%-}";
+      export VERSION_SAFE=${VERSION_SAFE:-${VERSION}}
+      VERSION_SAFE="${VERSION_SAFE:0:60}";
+      VERSION_SAFE="${VERSION_SAFE%-}";
+      echo "VERSION_NUM: ${VERSION_NUM}
+      VERSION: ${VERSION}
+      ${CYAN}VERSION_SAFE${CLEAR}: ${MAGENTA}${VERSION_SAFE}${CLEAR}";
+  cache_npm_push:
+    key: 
+      files:
+        - package-lock.json
+    policy: push
+    paths:
+      - node_modules
+  cache_npm_pull:
+    key: 
+      files:
+        - package-lock.json
+    policy: pull
+    paths:
+      - node_modules
+  cache_yarn_push:
+    key: 
+      files:
+        - yarn.lock
+    policy: push
+    paths:
+      - .yarn
+      - node_modules
+  cache_yarn_pull:
+    key: 
+      files:
+        - yarn.lock
+    policy: pull
+    paths:
+      - .yarn
+      - node_modules
+  #@check_NS_is_set
+  # проверяет, установлена ли переменная NS. Если нет - выход с ошибкой
+  # Vars: NS
+  check_NS_is_set:
+    - |
+      if [[ -z "${NS}" || "${NS}" == "none" ]]; then
+        echo "Вы должны эксплицитно указать переменную NS! 
+        Это можно сделать как на уровне пайплайна, так и в этой джобе.
+        Сейчас NS имеет значение ${NS}"
+        exit 1
+      else 
+        echo "NS=${MAGENTA}${NS}${CLEAR} CLUSTER=${MAGENTA}${CLUSTER}${CLEAR}" ;
+      fi
+  #@clone_repo
+  # Клонирует репозиторий в указанную папку. 
+  # Требует: curl, пустая папка
+  # CLONE_REPO_CLONE_GIT_FOLDER нужно установить в "true", если нужно так же скопировать папку .git указанной репы. В ином случае не устанавливаем.
+  # CLONE_REPO_USE_DEVELOP_ON_MISS в значении "true" заберет develop в случае отсутствия CLONE_REPO_REF
+  # Vars: CLONE_REPO_ID, CLONE_REPO_REF, CLONE_REPO_TARGET_DIR, CLONE_REPO_CLONE_GIT_FOLDER(копировать ли ), CLONE_REPO_USE_DEVELOP_ON_MISS
+  clone_repo:
+  - mkdir -p ${CLONE_REPO_TARGET_DIR} || true
+  # пытаемся выкачать архив по указанной ветке
+  - |
+    if curl --fail --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" --output cloned_repo.tar.gz ${CI_API_V4_URL}/projects/${CLONE_REPO_ID}/repository/archive.tar.gz?sha=${CLONE_REPO_REF} 
+    then
+      true
+    elif curl --fail --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" --output cloned_repo.tar.gz ${CI_API_V4_URL}/projects/${CLONE_REPO_ID}/repository/archive.tar.gz?sha=${CLONE_REPO_REF//nextbi/NEXTBI}
+    then 
+      true
+    elif [[ "${CLONE_REPO_USE_DEVELOP_ON_MISS}" == "true" ]] && curl --fail --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" --output cloned_repo.tar.gz ${CI_API_V4_URL}/projects/${CLONE_REPO_ID}/repository/archive.tar.gz?sha=develop
+    then
+      true
+    else 
+      echo "${RED}По всей видимости, в репозитории ${CYAN}http://gitlab.nextbi.ru/projects/${CLONE_REPO_ID}${RED} не найдена ветка ${CYAN}${CLONE_REPO_REF}.${CLEAR}
+      ${CYAN}CLONE_REPO_USE_DEVELOP_ON_MISS${CLEAR}=${MAGENTA}${CLONE_REPO_USE_DEVELOP_ON_MISS}${CLEAR}
+      Завершаем задачу..."
+      exit 1
+    fi
+  - tar -xzf cloned_repo.tar.gz -C ${CLONE_REPO_TARGET_DIR}/
+  - | 
+    CLONE_REPO_STRANGE_FOLDER=$(ls ${CLONE_REPO_TARGET_DIR}) 
+    shopt -s dotglob nullglob
+    [[ -z ${CLONE_REPO_CLONE_GIT_FOLDER} ]] && rm -rf ${CLONE_REPO_STRANGE_FOLDER}/.git || true 
+  - mv ${CLONE_REPO_TARGET_DIR}/${CLONE_REPO_STRANGE_FOLDER}/* ${CLONE_REPO_TARGET_DIR}/
+  - rm -rf ${CLONE_REPO_TARGET_DIR}/${CLONE_REPO_STRANGE_FOLDER}
+  #@copy_ssh_key
+  # Копирует в ~/.ssh/id_rsa дефолтный ssh-ключ. Используется в terraform-infra и сопутствующих репах
+  # Vars: PMSS_SSH_ID_RSA_PRIVATE_KEY, SSH_ID_RSA
+  copy_ssh_key:
+  - |
+    echo "${PMSS_SSH_ID_RSA_PRIVATE_KEY}" > ${SSH_ID_RSA} ;
+    chmod 600 ${SSH_ID_RSA} ;
+    ls -la ${SSH_ID_RSA} ;
+  #@.dns_record_put_and_reload
+  # Вспомогательная функция для @dns_record_add и @dns_record_delete
+  # Ей нужен файл ${DNS_CHANGE_FILE}
+  .dns_record_put_and_reload:
+  - |
+    [[ -f "${DNS_CHANGE_FILE}" ]] || exit 1 ;
+    export S3_UPLOAD_PATH_TO_FILE=${DNS_CHANGE_FILE} ;
+    export S3_UPLOAD_TARGET_PATH=/gitlab/${DNS_CHANGE_FILE} ;
+  - !reference [.templates, s3_upload]
+  - |
+    DNS_RECORD_ADD_TEXT="; CI-RECORDS
+    $(yq eval '
+      to_entries[] as $type 
+      | .[$type.key] 
+      | to_entries[] as $entry 
+      | ($entry.value 
+          | (.[]? // .)
+        ) as $ip 
+      | ($entry.key | sub("WILD(.*)","*${1}")) + " IN \($type.key | upcase) \($ip) ;"' ${DNS_CHANGE_FILE} )" ;
+    cp ${BIND9_SSH_KEY} ./bind_ssh_key ;
+    chmod 600 ./bind_ssh_key ;
+    ssh -i ./bind_ssh_key root@192.168.4.29 "sed -i '/; CI-RECORDS/,$ d' /var/bind/db.dev.nextbi.ru ;" ;
+    ssh -i ./bind_ssh_key root@192.168.4.29 "cat >> /var/bind/db.dev.nextbi.ru" <<EOF
+    ${DNS_RECORD_ADD_TEXT}
+    EOF
+    ssh -i ./bind_ssh_key root@192.168.4.29 'sed -i "s/.* ; Serial/                          $(date +%s)  ; Serial/g" /var/bind/db.dev.nextbi.ru ;' ;
+    ssh -i ./bind_ssh_key root@192.168.4.29 'rndc reload' ;
+    rm ${DNS_CHANGE_FILE} ;
+
+  #@dns_record_add
+  # Добавляет запись в *.dev.nextbi.ru
+  # a:   
+  #  example: 192.168.4.4
+  #  WILD.example: 
+  #  - 192.168.4.5
+  #  - 192.168.4.6
+  # Можно ставить любые записи - не только A.
+  # такой yaml создаст A записи example -> 192.168.4.4 *.example -> 192.168.4.5 *.example -> 192.168.4.6
+  # Требует: curl, yq, openssl
+  # Vars: DNS_RECORD_ADD_YAML_FILE
+  dns_record_add:
+  - curl -k -s --fail --show-error --output ${DNS_CHANGE_FILE} "https://${GITLAB_MINIO_URL}/gitlab/${DNS_CHANGE_FILE}"
+  - yq ea '. as $item ireduce ({}; . * $item )' -i ${DNS_CHANGE_FILE} ${DNS_RECORD_ADD_YAML_FILE}
+  - !reference [.templates,.dns_record_put_and_reload]
+  - |
+    echo "записи в DNS добавлены: 
+    $(cat ${DNS_RECORD_ADD_YAML_FILE} | sed 's/WILD/*/')";
+  #@dns_record_delete
+  # Удаляет записи в *.dev.nextbi.ru
+  # a:   
+  #  example: 192.168.4.4
+  #  WILD.example: 
+  #  - 192.168.4.5
+  # Можно ставить любые записи - не только A.
+  # такой yaml удалит A записи example -> 192.168.4.4 *.example -> 192.168.4.5 , если они были
+  # если DNS_RECORD_DELETE_YAML_FILE не задан, берет DNS_RECORD_ADD_YAML_FILE
+  # Требует: curl, yq, openssl
+  # Vars: DNS_RECORD_DELETE_YAML_FILE, DNS_RECORD_ADD_YAML_FILE
+  dns_record_delete:
+  - |
+    export DNS_RECORD_DELETE_YAML_FILE=${DNS_RECORD_DELETE_YAML_FILE:-${DNS_RECORD_ADD_YAML_FILE}} ;
+    echo "DNS_RECORD_DELETE_YAML_FILE: ${DNS_RECORD_DELETE_YAML_FILE}" ;
+    [[ -n "${DNS_RECORD_DELETE_YAML_FILE}" ]] || ( echo "Переменные DNS_RECORD_DELETE_YAML_FILE и  DNS_RECORD_ADD_YAML_FILE пусты" && exit 1 );
+    [[ -f "${DNS_RECORD_DELETE_YAML_FILE}" ]] || ( echo "Файла ${DNS_RECORD_DELETE_YAML_FILE} не существует!" && exit 1 );
+    curl -k -s --output ${DNS_CHANGE_FILE} "https://${GITLAB_MINIO_URL}/gitlab/${DNS_CHANGE_FILE}" ;
+    SAVEIFS=$IFS ;
+    IFS=$'\n' ;
+    for DNS_RECORD_DELETE_LINE in $(cat ${DNS_RECORD_DELETE_YAML_FILE} | grep -E '^ +.*$') ; 
+    do  
+      sed -i "/${DNS_RECORD_DELETE_LINE}/d" ${DNS_CHANGE_FILE} ;
+    done ;
+    IFS=$SAVEIFS ;
+  - !reference [.templates,.dns_record_put_and_reload]
+  - |
+    echo "записи в DNS удалены: 
+    $(cat $DNS_RECORD_DELETE_YAML_FILE)";
+    
+  #@docker_login
+  # логинимся в докер
+  # Требует: докер
+  # Vars: REGISTRY_USER, REGISTRY_PASSWORD, NEXUS_URL
+  docker_login:
+  - docker login -u $NEXUS_USER -p $NEXUS_PASSWORD $NEXUS_URL
+  #@download_file_from_gitlab
+  # Качаем файл из гитлаба
+  # Если задать DOWNLOAD_FILE_FROM_GITLAB_USE_DEFAULT_BRANCH_ON_MISS="true", в случае ненахода ветки\тега\коммита вернет содержимое дефолтной ветки
+  # Требует: jq
+  # Vars: DOWNLOAD_FILE_FROM_GITLAB_TARGET_PATH, DOWNLOAD_FILE_FROM_GITLAB_PROJECT_ID, DOWNLOAD_FILE_FROM_GITLAB_PATH_IN_PROJECT, DOWNLOAD_FILE_FROM_GITLAB_REF, DOWNLOAD_FILE_FROM_GITLAB_USE_DEFAULT_BRANCH_ON_MISS
+  download_file_from_gitlab:
+  - |
+    mkdir -p $(dirname ${DOWNLOAD_FILE_FROM_GITLAB_TARGET_PATH} ) || true
+    if [[ "$(curl --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" "${CI_API_V4_URL}/projects/${DOWNLOAD_FILE_FROM_GITLAB_PROJECT_ID}/repository/commits/${DOWNLOAD_FILE_FROM_GITLAB_REF}" | jq -r '.id' )" == "null" ]] ; 
+    then
+      echo "Не найден ref ${DOWNLOAD_FILE_FROM_GITLAB_REF} в репозитории с id ${DOWNLOAD_FILE_FROM_GITLAB_PROJECT_ID}. Возможно, нужно попробовать другой регистр?";
+      [[ "${DOWNLOAD_FILE_FROM_GITLAB_USE_DEFAULT_BRANCH_ON_MISS}" == "true" ]] && echo "Используем default ветку" || ( echo "Выходим, т.к. DOWNLOAD_FILE_FROM_GITLAB_USE_DEFAULT_BRANCH_ON_MISS != true" && exit 1 )
+    fi ;
+    curl  --output "${DOWNLOAD_FILE_FROM_GITLAB_TARGET_PATH}" \
+          --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${DOWNLOAD_FILE_FROM_GITLAB_PROJECT_ID}/repository/files/$(jq -rn --arg x "${DOWNLOAD_FILE_FROM_GITLAB_PATH_IN_PROJECT}" '$x|@uri')/raw?ref=${DOWNLOAD_FILE_FROM_GITLAB_REF}"
+  #@get_clickhouse_variables
+  # экспортирует всевозможные переменные клика
+  # Needs: kubectl_login
+  # Vars: NS, CH_HOST, CH_PORT_TCP, CH_PORT_HTTP, CH_USER, CH_PASSWORD
+  get_clickhouse_variables:
+    - | 
+      export CH_HOST="clickhouse"
+      export CH_PORT_TCP="8123"
+      export CH_PORT_HTTP="9000"
+      export CH_PORT="${CH_PORT_TCP}"
+      export CH_USER="admin"
+      export CH_PASSWORD="$(kubectl get secrets/nextbi-clickhouse-users --ignore-not-found --namespace ${NS} --template={{.data.admin}} | base64 -d)"
+      [[ -z "$CH_PASSWORD" ]] && export CH_PASSWORD="prt1knj2" || true 
+  
+  #@get_postgresql_variables
+  # экспортирует всевозможные переменные PSQL
+  # Needs: kubectl_login
+  # Vars: NS, PG_HOST, PG_PORT, PG_USER, PG_PASSWORD
+  get_postgresql_variables:
+    - | 
+      GET_POSTGRESQL_VARIABLES_POSTGRES_INSTANCE_NAME="nextbi-pg-${NS}"
+      export PG_HOST="${GET_POSTGRESQL_VARIABLES_POSTGRES_INSTANCE_NAME}"
+      export PG_PORT="5432"
+      export PG_USER="postgres"
+      export PG_PASSWORD="$(kubectl get secrets/postgres.${GET_POSTGRESQL_VARIABLES_POSTGRES_INSTANCE_NAME}.credentials.postgresql.acid.zalan.do --namespace ${NS} --template={{.data.password}} | base64 -d)"
+      [[ -z "$CH_PASSWORD" ]] && export CH_PASSWORD="prt1knj2" || true 
+      if [[ -z $CI_COMMIT_TAG ]]; then
+        export VERSION_NUM="${VERSION_MAJOR:-0}.${VERSION_MINOR:-0}.`git rev-list --count HEAD`"
+        export VERSION_HASH="${CI_COMMIT_SHORT_SHA}"
+        export VERSION="$VERSION_NUM.$VERSION_HASH-${CI_COMMIT_REF_SLUG}"
+      else
+        export VERSION_NUM=${CI_COMMIT_TAG}
+        export VERSION_HASH="${CI_COMMIT_SHORT_SHA}"
+        export VERSION="${CI_COMMIT_TAG}"
+      fi
+  #@git_submodule_update
+  # обновляет сабмодули
+  # Требует: git
+  git_submodule_update:
+    - git submodule init
+    - git submodule sync --recursive
+    - git submodule update --remote --recursive
+  #@gitlab_start_pipes
+  # бежим по всем репам и стартуем пайп с нужным ref
+  # Возвращает GITLAB_START_PIPES_PIPELINES_IDS - строка с значением PIPELINE_ID через пробел
+  # В GITLAB_START_PIPES_VARIABLES_TO_TRANSFER можно передать через пробел список имен переменных, которые нужно передать. 
+  # Требует: jq 
+  # Vars: GITLAB_START_PIPES_PROJECT_IDS, GITLAB_START_PIPES_TARGET_REF, GITLAB_API_TOKEN_BOT , GITLAB_START_PIPES_REUSE_EXISTING, GITLAB_START_PIPES_VARIABLES_TO_TRANSFER
+  gitlab_start_pipes:
+  - | 
+    export GITLAB_START_PIPES_EXIT_CODE=0
+    GITLAB_START_PIPES_PIPELINES_IDS=""
+    GITLAB_START_PIPES_PIPELINES_WEB_URLS=""
+    GITLAB_START_PIPES_PIPELINES_IDS_ALL=""
+  - echo "Создаем пайплайны с ref=${GITLAB_START_PIPES_TARGET_REF} для репозиториев с ID
+    ${GITLAB_START_PIPES_PROJECT_IDS}"
+  - |
+    for GITLAB_START_PIPES_PROJECT_ID in ${GITLAB_START_PIPES_PROJECT_IDS}; do
+      if [[ "${GITLAB_START_PIPES_REUSE_EXISTING}" == "true" ]]; then
+        GITLAB_START_PIPES_LAST_PIPELINE=$(curl --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_START_PIPES_PROJECT_ID}/pipelines/latest?per_page=100&ref=${GITLAB_START_PIPES_TARGET_REF}" || echo "Not found") ;
+        if [[ "${GITLAB_START_PIPES_LAST_PIPELINE}" != "Not found" ]]; then
+          GITLAB_START_PIPES_LAST_PIPELINE_SHA=$(echo -n ${GITLAB_START_PIPES_LAST_PIPELINE} | jq -r '.sha');
+          GITLAB_START_PIPES_REF_BRANCH=$(curl --insecure --silent --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_START_PIPES_PROJECT_ID}/repository/branches/${GITLAB_START_PIPES_TARGET_REF}");
+          if [[ "$( echo ${GITLAB_START_PIPES_REF_BRANCH} | jq -r '.message' )" != "404 Branch Not Found" ]]; then
+            if [[ "$( echo ${GITLAB_START_PIPES_REF_BRANCH} | jq -r '.commit.id')" == "${GITLAB_START_PIPES_LAST_PIPELINE_SHA}" ]]; then
+              GITLAB_START_PIPES_LAST_REF_ID=$(echo -n ${GITLAB_START_PIPES_LAST_PIPELINE} | jq -r '.sha');
+              echo "Найден уже запущенный пайплайн с последнего коммита в ветке: $(echo -n ${GITLAB_START_PIPES_LAST_PIPELINE} | jq -r '.web_url' )";
+              GITLAB_START_PIPES_PIPELINES_IDS="${GITLAB_START_PIPES_PIPELINES_IDS}";
+              continue ;
+            fi;
+          fi;
+        fi;
+      fi;
+
+      if [[ -n "${GITLAB_START_PIPES_VARIABLES_TO_TRANSFER}" ]] ; then
+        GITLAB_START_PIPES_VAR_LIST_JSON=$(for GITLAB_START_PIPES_VARIABLE_TO_TRANSFER in ${GITLAB_START_PIPES_VARIABLES_TO_TRANSFER}; do echo "{\"key\": \"${GITLAB_START_PIPES_VARIABLE_TO_TRANSFER}\",\"value\": \"${!GITLAB_START_PIPES_VARIABLE_TO_TRANSFER}\"}," ; done)
+        GITLAB_START_PIPES_VAR_LIST_JSON="{ \"ref\": \"${GITLAB_START_PIPES_TARGET_REF}\", \"variables\": [ ${GITLAB_START_PIPES_VAR_LIST_JSON:0:-1} ] }";
+        GITLAB_START_PIPES_RESPONSE=$(curl -X POST --insecure  --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}"  --header "Content-Type: application/json" --data "$( echo -n ${GITLAB_START_PIPES_VAR_LIST_JSON})"  "${CI_API_V4_URL}/projects/${GITLAB_START_PIPES_PROJECT_ID}/pipeline") || ( echo ${GITLAB_START_PIPES_RESPONSE} && exit 1 );
+      else
+        GITLAB_START_PIPES_RESPONSE=$(curl -X POST --insecure  --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_START_PIPES_PROJECT_ID}/pipeline?ref=${GITLAB_START_PIPES_TARGET_REF}") ;
+      fi
+      GITLAB_START_PIPES_PIPELINES_IDS="$( echo -n ${GITLAB_START_PIPES_RESPONSE} | jq -r '.id')" ;
+      GITLAB_START_PIPES_PIPELINES_IDS_ALL="${GITLAB_START_PIPES_PIPELINES_IDS_ALL} ${GITLAB_START_PIPES_PIPELINES_IDS}" ;
+      if [[ "$(echo -n ${GITLAB_START_PIPES_RESPONSE} | jq -r '.status' )" != "created" ]] ; then
+        echo "Не удалось создать пайплайн!
+            web_url: $(echo -n ${GITLAB_START_PIPES_RESPONSE} | jq -r '.web_url' )" ;
+        GITLAB_START_PIPES_EXIT_CODE=1 ;
+      else 
+        GITLAB_START_PIPES_PIPELINES_WEB_URLS="${GITLAB_START_PIPES_PIPELINES_WEB_URLS} $(echo -n ${GITLAB_START_PIPES_RESPONSE} | jq -r '.web_url' )"
+      fi; 
+    done ;
+    echo "Запущены пайплайны:";
+    for i in ${GITLAB_START_PIPES_PIPELINES_WEB_URLS}; do echo ${i}; done;
+    export GITLAB_START_PIPES_PIPELINES_IDS="${GITLAB_START_PIPES_PIPELINES_IDS}" ;
+    export GITLAB_START_PIPES_PIPELINES_IDS_ALL="$(echo "${GITLAB_START_PIPES_PIPELINES_IDS_ALL}" | xargs)" ;
+  #@gitlab_change_commit_yaml
+  # Заходит в указанную ветку репозитория и коммитит изменения в указанный ямль
+  # Требует: yq
+  # Vars: GITLAB_CHANGE_COMMIT_YAML_PROJECT_ID, GITLAB_CHANGE_COMMIT_YAML_TARGET_REF, GITLAB_CHANGE_COMMIT_YAML_FILE_PATH, GITLAB_CHANGE_COMMIT_YAML_FILE_TO_MERGE
+  gitlab_change_commit_yaml:
+  - |
+    # Get current file content from GitLab
+    GITLAB_CHANGE_COMMIT_YAML_CURRENT_FILE_CONTENT=$(curl --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" \
+      "${CI_API_V4_URL}/projects/${GITLAB_CHANGE_COMMIT_YAML_PROJECT_ID}/repository/files/$(echo -n "${GITLAB_CHANGE_COMMIT_YAML_FILE_PATH}" | jq -sRr @uri)/raw?ref=${GITLAB_CHANGE_COMMIT_YAML_TARGET_REF}" 2>/dev/null || echo "")
+        
+    # Create temporary files for yq processing
+    echo "${GITLAB_CHANGE_COMMIT_YAML_CURRENT_FILE_CONTENT}" > ${CI_JOB_ID}_current.yaml
+    
+    # Merge YAML files using yq
+    GITLAB_CHANGE_COMMIT_YAML_MERGED_CONTENT=$(yq eval-all 'select(fileIndex==0) * select(fileIndex==1)' ${CI_JOB_ID}_current.yaml ${GITLAB_CHANGE_COMMIT_YAML_FILE_TO_MERGE})
+    
+    # Base64 encode the merged content for API
+    GITLAB_CHANGE_COMMIT_YAML_ENCODED_CONTENT=$(echo -n "${GITLAB_CHANGE_COMMIT_YAML_MERGED_CONTENT}" | base64 -w0)
+    
+    # Commit using GitLab API
+    curl --insecure --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" \
+      -X PUT \
+      "${CI_API_V4_URL}/projects/${GITLAB_CHANGE_COMMIT_YAML_PROJECT_ID}/repository/files/$(echo -n "${GITLAB_CHANGE_COMMIT_YAML_FILE_PATH}" | jq -sRr @uri)" \
+      --form "branch=${GITLAB_CHANGE_COMMIT_YAML_TARGET_REF}" \
+      --form "content=${GITLAB_CHANGE_COMMIT_YAML_MERGED_CONTENT}" \
+      --form "commit_message=Auto-commit: yaml changes in ${GITLAB_CHANGE_COMMIT_YAML_FILE_PATH} ${CI_JOB_URL}" \
+      --form "author_email=gitlab_bot@nextbi.ru " \
+      --form "author_name=gitlab_bot"
+
+  #@gitlab_check_pipes
+  # бежим по всем апдейтнутым репам
+  # и ждем, пока последний пайп завершится успехом или провалом
+  # перезапускаем зафейленные билды, если это типичная ошибка.
+  # выводим все провалы в конце, если они есть
+  # падаем, если есть провалы
+  # Требует: jq 
+  # Vars: GITLAB_CHECK_PIPES_PROJECT_IDS, GITLAB_CHECK_PIPES_TARGET_REF, GITLAB_API_TOKEN_BOT
+  gitlab_check_pipes:
+  - |
+    export GITLAB_CHECK_PIPES_EXIT_CODE=0
+    for GITLAB_CHECK_PIPES_PROJECT_ID in ${GITLAB_CHECK_PIPES_PROJECT_IDS}; do
+      GITLAB_CHECK_PIPES_STATUS=""
+      GITLAB_CHECK_PIPES_URL=""
+      export GITLAB_CHECK_PIPES_WHILE_COUNTER=0
+      GITLAB_CHECK_PIPES_PIPE_ID=$(curl --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/pipelines/latest?per_page=100&ref=${GITLAB_CHECK_PIPES_TARGET_REF}" | jq -r '.id' ) \
+      || echo "curl failed to ${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/pipelines/latest?per_page=100&ref=${GITLAB_CHECK_PIPES_TARGET_REF}
+        Trying curl to ${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/pipelines?per_page=100&ref=${GITLAB_CHECK_PIPES_TARGET_REF}
+        ..." \
+        && GITLAB_CHECK_PIPES_PIPE_ID=$(curl --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/pipelines?per_page=100&ref=${GITLAB_CHECK_PIPES_TARGET_REF}" | jq -r '.[0].id' )
+
+      while [[ "${GITLAB_CHECK_PIPES_STATUS}" != "success" && "${GITLAB_CHECK_PIPES_STATUS}" != "failed" ]] ; do
+        
+        GITLAB_CHECK_PIPES_PIPELINE=$(curl --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/pipelines/${GITLAB_CHECK_PIPES_PIPE_ID}")
+
+        GITLAB_CHECK_PIPES_STATUS=$(echo $GITLAB_CHECK_PIPES_PIPELINE | jq -r '.status')
+        GITLAB_CHECK_PIPES_DURATION=$(echo $GITLAB_CHECK_PIPES_PIPELINE | jq -r '.duration')
+        GITLAB_CHECK_PIPES_URL=$(echo $GITLAB_CHECK_PIPES_PIPELINE | jq -r '.web_url')
+        [[ "${GITLAB_CHECK_PIPES_STATUS}" != "running" ]] && echo $GITLAB_CHECK_PIPES_URL status: $GITLAB_CHECK_PIPES_STATUS || true ;
+        [[ "${GITLAB_CHECK_PIPES_STATUS}" == "running" && "${GITLAB_CHECK_PIPES_WHILE_COUNTER}" == "0" ]] && echo $GITLAB_CHECK_PIPES_URL status: $GITLAB_CHECK_PIPES_STATUS || true ;
+        GITLAB_CHECK_PIPES_WHILE_COUNTER=1
+        GITLAB_CHECK_PIPES_BREAK_WHILE_CYCLE="false"
+        [[ $GITLAB_CHECK_PIPES_STATUS == "canceled" ]] && echo "Пайп был отменен. Если это произошло случайно - перезапустите пайп и эту джобу." && exit 1 || true
+        if [[ $GITLAB_CHECK_PIPES_STATUS == "failed" ]] ; then
+          GITLAB_CHECK_PIPES_JOB_ID_LIST_FAILED="$(curl --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/pipelines/$(echo -n $GITLAB_CHECK_PIPES_PIPELINE | jq -r '.id')/jobs?per_page=100&scope=failed" | jq -r '.[].id')" ;
+          for GITLAB_CHECK_PIPES_FAILED_JOB_ID in $( echo -n $GITLAB_CHECK_PIPES_JOB_ID_LIST_FAILED ) ; do
+            GITLAB_CHECK_PIPES_FAILED_JOB_JSON=$(curl -X GET --insecure --silent --fail --header  "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/jobs/${GITLAB_CHECK_PIPES_FAILED_JOB_ID}") ;
+            if [[ "$(echo ${GITLAB_CHECK_PIPES_FAILED_JOB_JSON} | jq -r '.name')" == "build" ]] ; then
+              curl -o job_log.log -X GET --insecure --silent --fail --header  "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/jobs/${GITLAB_CHECK_PIPES_FAILED_JOB_ID}/trace" ;
+              GITLAB_CHECK_PIPES_LAST_STRINGS=$(cat job_log.log| tail -n5) ;
+              if [[ ${GITLAB_CHECK_PIPES_LAST_STRINGS} == *"deleting file system after stage 0: unlinkat //app/%s: directory not empty"* ]] ; then 
+                echo "It's common build-job fail. Retrying...";
+                curl -X POST --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/jobs/${GITLAB_CHECK_PIPES_FAILED_JOB_ID}/retry" ;
+              else 
+                echo "FAIL! It's not common build-job fail. Fix it with your own hands." ;
+                GITLAB_CHECK_PIPES_BREAK_WHILE_CYCLE=true ;
+              fi ;
+              rm -Rf job_log.log ;
+            else
+              echo "FAIL! It's not common build-job fail. Fix it with your own hands." ;
+              GITLAB_CHECK_PIPES_BREAK_WHILE_CYCLE=true ;
+            fi ;
+          done;
+        fi ;
+        [[ "${GITLAB_CHECK_PIPES_BREAK_WHILE_CYCLE}" == "true" ]] && break || true
+        [[ $GITLAB_CHECK_PIPES_STATUS == "running" || $GITLAB_CHECK_PIPES_STATUS == "success" ]] || sleep 15
+        [[ $GITLAB_CHECK_PIPES_STATUS == "running" || $GITLAB_CHECK_PIPES_STATUS == "success" ]] || continue 
+        
+        GITLAB_CHECK_PIPES_JOB_ID_LIST_PENDING="$(curl --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/pipelines/$(echo -n $GITLAB_CHECK_PIPES_PIPELINE | jq -r '.id')/jobs?per_page=100&scope=pending" | jq -r '.[].id')"
+        for GITLAB_CHECK_PIPES_PENDING_JOB_ID in $( echo -n $GITLAB_CHECK_PIPES_JOB_ID_LIST_PENDING ) ; do
+          GITLAB_CHECK_PIPES_VAR_FOR_SILENT=$(curl -X POST --insecure --silent --fail --header  "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/jobs/${GITLAB_CHECK_PIPES_PENDING_JOB_ID}/cancel")
+          echo "Джоба $( echo -n ${GITLAB_CHECK_PIPES_VAR_FOR_SILENT} | jq -r '.name') зависла в статусе Pending... Перезапускаю..."
+          sleep 5
+          GITLAB_CHECK_PIPES_VAR_FOR_SILENT=$(curl -X POST --insecure --silent --fail --header "Private-Token: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${GITLAB_CHECK_PIPES_PROJECT_ID}/jobs/${GITLAB_CHECK_PIPES_PENDING_JOB_ID}/retry")
+          echo "Перезапущена"
+          sleep 10;
+        done;
+        
+      done
+      if [[ "${GITLAB_CHECK_PIPES_STATUS}" == "success" ]] ; then
+        echo "Успех: ${GITLAB_CHECK_PIPES_URL} (${GITLAB_CHECK_PIPES_DURATION} сек)"
+      else
+        echo "${GITLAB_CHECK_PIPES_URL} failed! GITLAB_CHECK_PIPES_EXIT_CODE=1 now"
+        GITLAB_CHECK_PIPES_EXIT_CODE=1
+        GITLAB_CHECK_PIPES_FAILED_URLS="${GITLAB_CHECK_PIPES_FAILED_URLS} ${GITLAB_CHECK_PIPES_URL}"
+      fi
+    done
+    [[ -n "${GITLAB_CHECK_PIPES_FAILED_URLS}" ]] && ( for GITLAB_CHECK_PIPES_FAIL_URL in ${GITLAB_CHECK_PIPES_FAILED_URLS}; do echo "ПРОВАЛ!!! ${GITLAB_CHECK_PIPES_FAIL_URL}" ; done ) || echo "Все пайплайны прошли успешно"
+    if [[ "${GITLAB_CHECK_PIPES_EXIT_CODE}" != "0" ]] ; then exit ${GITLAB_CHECK_PIPES_EXIT_CODE} ; fi
+  #@gitlab_white_list
+  # Проверяет, может ли пользователь запускать эту джобу.
+  # Пользователь должен состоять в одной из групп GITLAB_WHITE_LIST_USER_GROUPS_FOR_JOB
+  # Пример задания нескольких групп: "people/backend people/devops"
+  # Требует: curl
+  # Vars: GITLAB_WHITE_LIST_USER_GROUPS_FOR_JOB
+  gitlab_white_list:
+  - |
+    if [[ -n "${GITLAB_WHITE_LIST_USER_GROUPS_FOR_JOB}" ]] 
+    then 
+        export EXIT_STATUS=1  || true
+        export GITLAB_WHITE_LIST_FOUND_IN_GROUP=""
+        for GITLAB_WHITE_LIST_USER_GROUP_FOR_JOB in ${GITLAB_WHITE_LIST_USER_GROUPS_FOR_JOB};
+        do
+            echo "checking ${MAGENTA}${GITLAB_WHITE_LIST_USER_GROUP_FOR_JOB}${CLEAR}"
+            [[ "$(curl -s --retry 5 --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" \
+                --url "${CI_API_V4_URL}/groups/${GITLAB_WHITE_LIST_USER_GROUP_FOR_JOB//\//%2F}/members/${GITLAB_USER_ID}" | jq -r '.membership_state')" == "active" ]] && GITLAB_WHITE_LIST_FOUND_IN_GROUP="${GITLAB_WHITE_LIST_USER_GROUP_FOR_JOB}" && EXIT_STATUS=0 || true
+        done
+        if [[ "${EXIT_STATUS}" == "1" ]];
+        then
+            echo "${RED}Пользователь ${MAGENTA}${GITLAB_USER_NAME}${RED} с ID ${MAGENTA}${GITLAB_USER_ID}${RED} не найден в группах ${YELLOW}${GITLAB_WHITE_LIST_USER_GROUPS_FOR_JOB}${RED}.
+            Выходим...${CLEAR}"
+            exit ${EXIT_STATUS}
+        else
+            echo "${GREEN}Пользователь ${CYAN}${GITLAB_USER_NAME}${GREEN} c ID ${CYAN}${GITLAB_USER_ID}${GREEN} был найден в группе ${MAGENTA}${GITLAB_WHITE_LIST_FOUND_IN_GROUP}${CLEAR}"
+        fi
+    fi
+  #@gotpl_download
+  # загружает gotpl
+  # Требует: curl
+  gotpl_download:
+  - curl -k -s --fail --show-error https://nexus.nextbi.ru/repository/raw-devops-infrastructure/bin/gotpl -o ./gotpl
+  - chmod +x ./gotpl
+  #@helm_reassign_resources_from_atomic_release
+  # переопределяет ресурсы из старого единого релиза в новый. Для работы требуется отрендеренный темплейт: HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_RENDERED_MANIFEST
+  # Требует: helm
+  # Vars: HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE, NS, APP, HELM_CHART_URL, HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_RENDERED_MANIFEST
+  helm_reassign_resources_from_atomic_release:
+  # Проверяем, нужно ли вообще переназначать что-либо
+    - |
+      [[ "${HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE}" == "true" ]] && kubectl get ns $NS || export HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE="false" ;
+      [[ "${HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE}" == "true" ]] && helm get metadata ${APP} -n $NS && export HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE="false" || true ;
+      [[ "${HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE}" == "true" ]] && kubectl get deployment ${APP} -n $NS -o jsonpath='{.metadata.name}' || export HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE="false"
+    - |
+      if [[ "${HELM_FORCE_ASSIGN_OLD_RESOURCES_TO_NEW_RELEASE}" == "true" ]] ; then
+        echo "Переопределяем ресурсы из старого единого релиза в новый" ;
+        echo "metadata:
+                labels:
+                  'app.kubernetes.io/managed-by': 'Helm'
+                  'app.kubernetes.io/instance': '${APP}'
+                  'app.kubernetes.io/name': '${APP}'
+                annotations:
+                  'meta.helm.sh/release-name': '${APP}'
+                  'meta.helm.sh/release-namespace': '$NS'" > helm_reassign_resources_from_atomic_release_patch.yaml ;
+
+        export HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_COUNTER=0 ;
+        while IFS= read -r HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_LINE; do
+            [[ -n "$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_LINE" ]] || continue ;
+            HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_COUNTER=$((HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_COUNTER + 1)) ;
+            if [[ "$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_COUNTER" == "1" ]] ; then
+                HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_KIND="$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_LINE" ;
+            elif [[ "$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_COUNTER" == "2" ]] ; then
+                HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAME="$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_LINE" ;
+            else
+                HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAMESPACE="$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_LINE" ;
+                echo "Will patch $HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_KIND $HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAME $( [[ -n "$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAMESPACE" ]] && echo -n "-n $NS" || echo -n "" )" ;
+                kubectl patch "$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_KIND" "$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAME" \
+                    $( [[ -n "$HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAMESPACE" ]] && echo -n "-n $NS" || echo -n "" ) \
+                    --patch-file helm_reassign_resources_from_atomic_release_patch.yaml || true ;
+                HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_COUNTER=0 ;
+                HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_KIND="" ;
+                HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAME="" ;
+                HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_NAMESPACE="" ;
+            fi ;
+        done < <(yq '.kind, .metadata.name, .metadata.namespace' ${HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_RENDERED_MANIFEST} | sed 's/---//g');
+      fi;
+  #@helm_repo_add_nextbi
+  # добавляет репу nextbi в хельм-репы
+  # Требует: helm
+  # Vars: HELM_REGISTRY_URL
+  helm_repo_add_nextbi:
+  - helm repo add nextbi ${HELM_REGISTRY_URL}  --insecure-skip-tls-verify
+  #@download_and_change_chart
+  # загужает чарт и меняет его - добавляет templates из репы и объединяет values
+  # подставляет в values всякие значения. 
+  # Полезно как при сборке хельм-пакета, так и при деплое
+  # на выходе дает папку ./chart НО НЕ ПРОВАЛИВАЕТ В НЕЕ!
+  # Требует: yq, calc_version_job
+  # Vars: APP, VALUE_FILE
+  download_and_change_chart:
+    - export HELM_CLONE_REPO_REF=${CI_COMMIT_TAG:-${HELM_CLONE_REPO_REF}}
+    - >
+      [[ "$CI_PROJECT_NAME" != "$(yq -r '.fullnameOverride' ${VALUE_FILE})" ]] && echo "В ${VALUE_FILE} .fullnameOverride != $CI_PROJECT_NAME !!! Добавьте этот ключ в ямль или измените название репы - в зависимости от того, что не осответствует стандартам." && exit 1 || true
+    - |
+      DOWNLOAD_AND_CHANGE_CHART_TITLE=${CI_COMMIT_TITLE// /-}
+      DOWNLOAD_AND_CHANGE_CHART_TITLE=${DOWNLOAD_AND_CHANGE_CHART_TITLE//[!-0-9a-zA-Z]/}
+      DOWNLOAD_AND_CHANGE_CHART_TITLE=${DOWNLOAD_AND_CHANGE_CHART_TITLE:0:63}
+      until [[ "${DOWNLOAD_AND_CHANGE_CHART_TITLE:0:1}" != "-" ]]; do
+        DOWNLOAD_AND_CHANGE_CHART_TITLE="${DOWNLOAD_AND_CHANGE_CHART_TITLE:1}" ;
+      done;
+      until [[ "$( echo ${DOWNLOAD_AND_CHANGE_CHART_TITLE} | awk '{ print substr($0, length($0), 1) }' )" != "-" ]]; do
+        DOWNLOAD_AND_CHANGE_CHART_TITLE="${DOWNLOAD_AND_CHANGE_CHART_TITLE:0:-1}" ;
+      done;
+      DOWNLOAD_AND_CHANGE_CHART_TITLE=${DOWNLOAD_AND_CHANGE_CHART_TITLE,,}
+      if [[ -z ${DISABLE_ADDITIONAL_LABELS} ]]; then
+        echo "Labels:
+        ${GREEN}nextbi-version:${CLEAR} ${VERSION_SAFE:-${VERSION}}
+        ${GREEN}nextbi-commit:${CLEAR} ${CI_COMMIT_SHORT_SHA}
+        ${GREEN}nextbi-commit-title:${CLEAR} ${DOWNLOAD_AND_CHANGE_CHART_TITLE}
+        ${GREEN}nextbi-ci-job-id:${CLEAR} ${CI_JOB_ID}"
+        yq -i ".labels += { \"nextbi-version\": \"${VERSION_SAFE:-${VERSION}}\", \"nextbi-commit\": \"${CI_COMMIT_SHORT_SHA}\", \"nextbi-commit-title\": \"${DOWNLOAD_AND_CHANGE_CHART_TITLE}\", \"nextbi-ci-job-id\": \"${CI_JOB_ID}\" }" ${VALUE_FILE}
+      fi
+      yq -i ".image.tag |= \"${CI_COMMIT_TAG:+release-}${VERSION_SAFE:-${VERSION}}\"" ${VALUE_FILE}
+      yq -i ".global.fqdn |= \"${K8S_FQDN}\"" ${VALUE_FILE}
+    - |
+      export CLONE_REPO_ID="${HELM_CLONE_REPO_ID}"
+      export CLONE_REPO_REF="${HELM_CLONE_REPO_REF}"
+      export CLONE_REPO_TARGET_DIR="${HELM_CLONE_REPO_TARGET_DIR}"
+    - !reference [.templates, clone_repo]
+    - |
+      yq -i ".name |= \"${APP}\"" ./chart/Chart.yaml
+      yq -i ".version |= \"${VERSION_NUM}-sha${VERSION_HASH}\"" ./chart/Chart.yaml
+      yq -i ".appVersion |= \"${VERSION_SAFE:-${VERSION}}\"" ./chart/Chart.yaml
+      yq -i ".sources |= [\"${CI_PROJECT_URL}\"]" ./chart/Chart.yaml
+      yq -i ".home |= \"https://nextbi.ru\"" ./chart/Chart.yaml
+    # Мерджим values.yaml из chart и из репы в один ./chart/values.yaml
+    - yq ea '. as $item ireduce ({}; . * $item )' -i ./chart/values.yaml ${VALUE_FILE}
+    # Если есть папка templates - уносим ее в templates
+    - |
+      if [ -d "k8s/templates" ] && [ -n "$(ls -A "k8s/templates")" ]; then
+        for i in $(ls  k8s/templates/ ); do 
+          cp  k8s/templates/${i} chart/templates/$([[ "${i:0:1}" == "_" ]] && echo -n "_")${CI_PROJECT_NAME}-${i} ; 
+        done;
+      else
+        echo "No extra-templates found"
+      fi
+    - |
+      if [ -d "k8s/files" ] && [ -n "$(ls -A "k8s/files")" ]; then
+        mkdir -p chart/files || true ;
+        for i in $(ls  k8s/files/ ); do 
+          cp  k8s/files/${i} chart/files/${i} ; 
+        done;
+      else
+        echo "No extra-files found"
+      fi
+    # переносим values - нужно для деплоя
+    - |
+      for i in $(ls  k8s/values/ ); do 
+        if [[ "${i}" != "values.yaml" ]]; then
+          cp  k8s/values/${i} chart/${i} ; 
+        fi;
+      done;
+  #@is_tag_exists
+  # Курлит нексус на тему существования нужного тега -  ${CI_COMMIT_SHORT_SHA}
+  # Требует стандартно описанного через переменные имени контейнера.
+  # Vars: REGISTRY_IMAGE, IMAGE_NAME, IMAGE_TAIL_SUBNAME, CONTAINER_COMPUTED_IMAGE_NAME, CHECK_IMAGE_PARTIAL_PATH, IS_TAG_EXISTS
+  is_tag_exists:
+    - |
+      curl --version || (apt update -q && apt install curl -y -q) || apk add curl
+      jq --version || (apt update -q && apt install jq -y -q) || apk add jq
+      export CONTAINER_COMPUTED_IMAGE_NAME="$REGISTRY_IMAGE/${IMAGE_NAME:-${CI_PROJECT_NAME}}${IMAGE_TAIL_SUBNAME:+/}${IMAGE_TAIL_SUBNAME}" ;
+      IMAGE_FULL_PATH=${CONTAINER_COMPUTED_IMAGE_NAME}:${VERSION} ;
+      export CHECK_IMAGE_PARTIAL_PATH=${CONTAINER_COMPUTED_IMAGE_NAME//$NEXUS_URL\//} ;
+      export IS_TAG_EXISTS=$(curl -k https://${NEXUS_URL}/v2/${CHECK_IMAGE_PARTIAL_PATH}/tags/list | jq -r ".tags[]|select(. == \"${CI_COMMIT_SHORT_SHA}\")")
+    
+  #@k8s_export_vars
+  # Экспортирует нужные переменные K8S_API_URL, K8S_TOKEN, K8S_SUBDOMAIN, K8S_FULL_DOMAIN, K8S_FQDN
+  # Для работы требует переменной CLUSTER и переменной-файла на уровне инстанса гитлаба с именем, указанным в CLUSTER
+  # Vars: CLUSTER, ${!CLUSTER}, K8S_API_URL, K8S_TOKEN, K8S_SUBDOMAIN, K8S_FULL_DOMAIN, K8S_FQDN
+  k8s_export_vars:
+    - set -o allexport
+    - |
+      if [[ -f "${!CLUSTER}" ]] 
+      then
+        source ${!CLUSTER}
+      else
+        echo "${!CLUSTER}" > devops_temp_cluster_file
+        source devops_temp_cluster_file
+      fi
+    - set +o allexport
+
+  #@kaniko_login
+  # логинимся в реджистри
+  # Vars: REGISTRY_USER, REGISTRY_PASSWORD, REGISTRY_IMAGE
+  kaniko_login:
+    - echo "{\"auths\":{\"$REGISTRY_IMAGE\":{\"username\":\"$NEXUS_USER\",\"password\":\"$NEXUS_PASSWORD\"}}}" > /kaniko/.docker/config.json
+  
+  #@kubectl_login
+  # логинимся в куб. См. комменатрии к переменной CLUSTER в .variables
+  # Требует: kubectl
+  # Vars: CLUSTER, ${!CLUSTER}, K8S_API_URL, K8S_TOKEN, K8S_SUBDOMAIN, K8S_FULL_DOMAIN, K8S_FQDN
+  kubectl_login:
+    - !reference [.templates, k8s_export_vars]
+    - 'kubectl config set-cluster k8s --server="$K8S_API_URL" --insecure-skip-tls-verify=true'
+    - 'kubectl config set-credentials admin --token="$K8S_TOKEN"'
+    - 'kubectl config set-context default --cluster=k8s --user=admin'
+    - 'kubectl config use-context default'
+    - 'echo ${K8S_SUBDOMAIN}: ${K8S_API_URL} $K8S_FQDN'
+  #@kubectl_show_error
+  # Смотрим зафейленные поды, обрабатываем самые явные ошибки, выводим все это дело.
+  # Требует: kubectl, kubectl_login
+  # Vars: RANCHER_URL, CLUSTER, K8S_NS
+  kubectl_show_error:
+  - | 
+    export DOWNLOAD_FILE_FROM_GITLAB_USE_DEFAULT_BRANCH_ON_MISS="true"
+    export DOWNLOAD_FILE_FROM_GITLAB_TARGET_PATH=kubectl_show_error.sh
+    export DOWNLOAD_FILE_FROM_GITLAB_PATH_IN_PROJECT=misc/kubectl_show_error.sh
+    export DOWNLOAD_FILE_FROM_GITLAB_PROJECT_ID=183
+    export DOWNLOAD_FILE_FROM_GITLAB_REF=${DEFAULT_DEPLOY_REPO_REF}
+  - !reference [.templates, download_file_from_gitlab]
+  - /bin/sh kubectl_show_error.sh
+  #@no_need_rebuild_first_check
+  # Требует: ${GITLAB_CI_DOTENV_FILE} передан как reports.dotenv
+  no_need_rebuild_first_check:
+    - touch ${GITLAB_CI_DOTENV_FILE} ;
+    - |
+      if [[ -n "${IS_TAG_EXISTS}" ]] ; then
+        if [[ ${FORCE_REBUILD} != "true" ]] ; then
+          echo "Найден уже собранный контейнер с тегом ${CI_COMMIT_SHORT_SHA}. 
+            Отменяем последующую сборку в пользу перетегивания. 
+            Для изменения этого поведения выставьте FORCE_REBUILD в 'true' на уровне пайплайна";
+          echo 'CI_NO_NEED_REBUILD=true' > ${GITLAB_CI_DOTENV_FILE} ;
+          CI_NO_NEED_REBUILD=true
+        else
+          echo "Нашли тег, но билд будет все равно полным, т.к. выставлена FORCE_REBUILD=${FORCE_REBUILD}" ;
+        fi ;
+        cat ${GITLAB_CI_DOTENV_FILE} ;
+      fi ;
+  #@no_need_rebuild
+  #Требует: no_need_rebuild_first_check где-то в пайпе 
+  # Если выставлена NO_NEED_REBUILD_IS_IT_TEST == "true", 
+  # то берет в качестве exit-статуса exit-status последней джобы тестов с этим коммитом.
+  # Если выставлена NO_NEED_REBUILD_IS_IT_TEST или NO_NEED_REBUILD_EXIT=true, выйдет.
+  # Хорошо работает в связке с is_tag_exists или прокинутыми артефактами из no_need_rebuild_first_check
+  #Vars: NO_NEED_REBUILD_IS_IT_TEST NO_NEED_REBUILD_EXIT CI_NO_NEED_REBUILD IS_TAG_EXISTS
+  no_need_rebuild:
+    - !reference [.templates, yq_download]
+    - |
+      if [[ -n "${IS_TAG_EXISTS}" ]]; then export CI_NO_NEED_REBUILD=true; fi
+      echo "FORCE_REBUILD:${FORCE_REBUILD} CI_NO_NEED_REBUILD:${CI_NO_NEED_REBUILD}"
+      if [[ "${CI_NO_NEED_REBUILD}" == "true" && "${FORCE_REBUILD}" == "false" ]] ; then 
+        echo "Этот код уже собирался. 
+        Пропускаем шаг. 
+        Для пересборки перезапустите пайплайн с переменной FORCE_REBUILD == 'true'"; 
+
+        if [[ "${NO_NEED_REBUILD_IS_IT_TEST}" == "true" ]] ; then
+            NO_NEED_REBUILD_LAST_TEST_PIPELINE_ID=$(curl --insecure --silent --fail --show-error --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines?sort=desc&sha=${CI_COMMIT_SHA}" | yq -r -p json -o yaml '.[1].id') || true
+            NO_NEED_REBUILD_LAST_TEST_JOB="$(curl --insecure --silent --fail --show-error --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${NO_NEED_REBUILD_LAST_TEST_PIPELINE_ID}/jobs?per_page=100" | yq -r -p json -o yaml '.[] | select (.name == "'${CI_JOB_NAME}'")')" || true
+            NO_NEED_REBUILD_LAST_TEST_JOB_STATUS=$(echo "$NO_NEED_REBUILD_LAST_TEST_JOB" | yq -r -p yaml '.status // "unknown"')
+            if [[ "${NO_NEED_REBUILD_LAST_TEST_JOB_STATUS}" != "success" ]] ; then
+              echo "${RED}Предыдущая джоба ${CI_JOB_NAME} не прошла успешно.${CLEAR}
+              Ссылка: ${MAGENTA}$(echo "$NO_NEED_REBUILD_LAST_TEST_JOB" | yq -r -p yaml '.web_url // "Не найдено. Вероятно, это баг. Проверьте соседние пайпы в этой ветке или МР. Если не нашли чего-то странного - зовите девопсов"')${CLEAR}"
+
+              NO_NEED_REBUILD_FIRST_TEST_PIPELINE_ID=$(curl --insecure --silent --fail --show-error --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines?sort=asc&sha=${CI_COMMIT_SHA}" | yq -r -p json -o yaml '.[0].id') || true
+              NO_NEED_REBUILD_FIRST_TEST_JOB_WEB_URL="$(curl --insecure --silent --fail --show-error --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN_BOT}" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${NO_NEED_REBUILD_FIRST_TEST_PIPELINE_ID}/jobs?per_page=100" | yq -r -p json -o yaml '.[] | select (.name == "'${CI_JOB_NAME}'").web_url')" || true
+              echo "Ссылка на первую тестовую джобу: ${MAGENTA}${NO_NEED_REBUILD_FIRST_TEST_JOB_WEB_URL}${CLEAR}"
+              
+              export NO_NEED_REBUILD_LAST_TEST_EXIT_STATUS=1
+            else
+              export NO_NEED_REBUILD_LAST_TEST_EXIT_STATUS=0
+            fi
+            echo "${YELLOW}Статус предыдущей джобы ${CI_JOB_NAME}: ${GREEN}${NO_NEED_REBUILD_LAST_TEST_JOB_STATUS}${CLEAR}"
+            exit $NO_NEED_REBUILD_LAST_TEST_EXIT_STATUS
+        fi
+        if [[ "${NO_NEED_REBUILD_EXIT}" == "true" ]] ; then
+          echo "Выход из пайплайна, т.к. NO_NEED_REBUILD_EXIT=true"
+          exit 0
+        fi
+      fi;
+  proxmox_get_ticket:
+  - |
+    PROXMOX_GET_TICKET_RESPONSE=$(curl -sk -X POST "${TERRAFORM_API_URL}/api2/json/access/ticket" -d "username=${TERRAFORM_USER}" -d "password=${TERRAFORM_PASSWORD}")
+
+    export PROXMOX_TICKET=$(echo "$PROXMOX_GET_TICKET_RESPONSE" | jq -r '.data.ticket')
+
+    if [[ -z "$PROXMOX_TICKET" || "$PROXMOX_TICKET" == "null" ]]; then
+      echo "❌ Не удалось получить тикет, проверь логин/пароль."
+      exit 2
+    fi
+  proxmox_get_post_functions_set:
+  - !reference [.templates, proxmox_get_ticket]
+  - |
+    proxmox_get() {
+      curl -X GET -sk -b "PVEAuthCookie=${PROXMOX_TICKET}" ${TERRAFORM_API_URL}$@
+    }
+    proxmox_post() {
+      curl -X POST -sk -b "PVEAuthCookie=${PROXMOX_TICKET}" ${TERRAFORM_API_URL}$@
+    }
+  
+  tf_set_source_name_to_vm_section:
+    
+    - !reference [.templates, proxmox_get_post_functions_set]
+    - |
+      echo "TF_ENV_FILE=${CYAN}${TF_ENV_FILE}${CLEAR}"
+      echo "TF_SET_SOURCE_NAME_TO_VM_SECTION=${TF_SET_SOURCE_NAME_TO_VM_SECTION}"
+      echo "RELEASE_VERSION_TO_CREATE=${RELEASE_VERSION_TO_CREATE}"
+      if  [[ "$( yq -r '.auto_source_name_to_vm // false' ${TF_ENV_FILE})" == "true" ]] ; then 
+        export  TF_SET_SOURCE_NAME_TO_VM_SECTION="true" ; 
+      fi
+      if [[ "${TF_SET_SOURCE_NAME_TO_VM_SECTION}" == "true" ]] ; then
+        if [[ -n "${RELEASE_VERSION_TO_CREATE}" ]] ; then
+          PMSS_VM_NAME="autotests-packer-pmss-${RELEASE_VERSION_TO_CREATE}-${OS_TYPE}"
+          NODE_VM_NAME="autotests-packer-node-${RELEASE_VERSION_TO_CREATE}-${OS_TYPE}"
+          PMSS_VM_ID=$(proxmox_get /api2/json/cluster/resources?type=vm | jq -r --arg name "${PMSS_VM_NAME}" '.data[] | select(.name==$name) | .vmid // 0')
+          NODE_VM_ID=$(proxmox_get /api2/json/cluster/resources?type=vm | jq -r --arg name "${NODE_VM_NAME}" '.data[] | select(.name==$name) | .vmid // 0')
+          PMSS_NODE_NAME=$(proxmox_get /api2/json/cluster/resources?type=vm | jq -r --arg name "${PMSS_VM_NAME}" '.data[] | select(.name==$name) | .node // ""')
+          NODE_NODE_NAME=$(proxmox_get /api2/json/cluster/resources?type=vm | jq -r --arg name "${NODE_VM_NAME}" '.data[] | select(.name==$name) | .node // ""')
+          echo "
+          source_name_to_vm:
+            pmss: 
+              vm_id: ${PMSS_VM_ID}
+              name: ${PMSS_VM_NAME}
+              node_name: ${PMSS_NODE_NAME}
+            node: 
+              vm_id: ${NODE_VM_ID}
+              name: ${NODE_VM_NAME}
+              node_name: ${NODE_NODE_NAME}
+          " | yq -i eval-all '. as $item ireduce ({}; . * $item )'  ${TF_ENV_FILE} -
+          
+          yq '.source_name_to_vm' ${TF_ENV_FILE}
+        else
+          for KEY in $(yq  '.source_name_to_vm| keys()| .[]' "${TF_ENV_FILE}") ; do 
+            echo "${GREEN}Ищем vmID для ${MAGENTA}$KEY${CLEAR}" ; 
+            VM_NAME=$(yq -r ".source_name_to_vm.$KEY.name // \"\"" "${TF_ENV_FILE}")
+            VM_ID=$(proxmox_get /api2/json/cluster/resources?type=vm | jq -r --arg name "${VM_NAME}" '.data[] | select(.name == $name) | .vmid // 0')
+            VM_NODE_NAME=$(proxmox_get /api2/json/cluster/resources?type=vm | jq -r --arg name "${VM_NAME}" '.data[] | select(.name == $name) | .node // ""')
+            echo "Найден vmID для ${MAGENTA}$KEY${CLEAR}: ${CYAN}$VM_ID${CLEAR}"
+            yq eval -i ".source_name_to_vm.$KEY.vm_id = ${VM_ID}" "${TF_ENV_FILE}"
+            yq eval -i ".source_name_to_vm.$KEY.node_name = \"${VM_NODE_NAME}\"" "${TF_ENV_FILE}"
+
+          done
+        fi
+      fi
+  #@s3_download
+  # Загружает файд из minio.k8s-dev.nextbi.ru
+  # Требует: curl
+  # Vars: S3_DOWNLOAD_PATH_TO_FILE, S3_DOWNLOAD_TARGET_PATH
+  s3_download:
+    - |
+      S3_UPLOAD_FILE_URL="https://${GITLAB_MINIO_URL}${S3_UPLOAD_TARGET_PATH}"
+      [[ -f "./mc" ]] || curl -k -s --output ./mc https://${GITLAB_MINIO_URL}/gitlab/mc
+      chmod +x ./mc
+      ./mc alias set gitlab-minio http://${GITLAB_MINIO_URL} ${GITLAB_MINIO_ACCESS_KEY} ${GITLAB_MINIO_SECRET_KEY}
+      ./mc cp gitlab-minio${S3_DOWNLOAD_PATH_TO_FILE}  ${S3_DOWNLOAD_TARGET_PATH}
+  #@s3_upload
+  # Загружает файл в minio.k8s-dev.nextbi.ru. Возвращает ссылку в S3_UPLOAD_FILE_URL
+  # S3_UPLOAD_TARGET_PATH example: /bucketname/path/to/file/on/minio
+  # Требует: curl
+  # Vars: S3_UPLOAD_PATH_TO_FILE, S3_UPLOAD_TARGET_PATH, S3_UPLOAD_FILE_URL
+  s3_upload:
+    - |
+      S3_UPLOAD_FILE_URL="https://${GITLAB_MINIO_URL}${S3_UPLOAD_TARGET_PATH}"
+      [[ -f "./mc" ]] || curl -k -s --output ./mc https://${GITLAB_MINIO_URL}/gitlab/mc
+      chmod +x ./mc
+      ./mc alias set gitlab-minio http://${GITLAB_MINIO_URL} ${GITLAB_MINIO_ACCESS_KEY} ${GITLAB_MINIO_SECRET_KEY}
+      ./mc cp ${S3_UPLOAD_PATH_TO_FILE} gitlab-minio${S3_UPLOAD_TARGET_PATH} 
+      [[ $? -eq 0 ]] && echo "✅ Файл успешно загружен: ${S3_UPLOAD_FILE_URL}" || ( echo "❌ Ошибка загрузки!" &&  exit 1 )
+
+  #@yarn_set_to_nexus
+  # создает .npmrc к нексусу
+  # Vars: NEXUS_URL, NEXUS_USER, NEXUS_PASSWORD
+  yarn_set_to_nexus:
+    - |
+      printf 'registry=https://nexus.nextbi.ru/repository/npm-group/\nalways-auth=true\n//nexus.nextbi.ru/repository/npm-group/:username=%s\n//nexus.nextbi.ru/repository/npm-group/:_password=%s\n//nexus.nextbi.ru/repository/npm-group/:email=ci@local\nstrict-ssl=false\nfetch-retries=8\nfetch-retry-factor=2\nfetch-retry-mintimeout=30000\nfetch-retry-maxtimeout=300000\nfetch-timeout=1800000\nmaxsockets=4\n' \
+      "$NEXUS_USER" \
+      "$(printf "%s" "$NEXUS_PASSWORD" | base64 | tr -d '\n')" > .npmrc
+  #@yq_download
+  # Загружает yq и, заодно, устанавливает curl
+  yq_download:
+    - |
+      yq --version && YQ_DOWNLOAD=false || YQ_DOWNLOAD=true
+      if [[ "${YQ_DOWNLOAD}" == "true" ]]; then
+        curl -V 1>/dev/null || apt update -qq  && apt install curl -y -qq || apk add curl
+        curl -k -L https://nexus.nextbi.ru/repository/raw-devops-infrastructure/yq_linux_amd64/yq_linux_amd64 > /bin/yq
+        chmod +x /bin/yq
+      fi
+
+###
+#
+# JOBS templates
+#
+###
+.deploy:
+  stage: deploy
+  image: ${HELM_IMAGE}
+  interruptible: false
+  variables:
+    IS_DEV_FLAG: "true"
+    GITLAB_WHITE_LIST_USER_GROUPS_FOR_JOB: ""
+  needs:
+  - job: build
+  # ${VERSION} берется из !reference [.templates, calc_version_job] 
+  # прокидывается в Chart.yaml в appVersion внутри !reference [.templates, download_and_change_chart]
+  script:
+    - !reference [.templates, check_NS_is_set]
+    - !reference [.templates, gitlab_white_list]
+    - !reference [.templates, calc_version_job]
+    - !reference [.templates, kubectl_login]
+    - !reference [.templates, download_and_change_chart]
+    - cd ./chart/
+    - |
+      echo "deploy on $NS IS_DEV_FLAG: ${IS_DEV_FLAG}"
+      if [[ "${DEPLOY_CONFIG_MAPS}" == "false" ]]; then 
+        for YML in $(ls ./*.yaml); do
+          yq -i 'del(.extraConfigmaps)' -i ${YML}
+        done
+      else
+        echo "DEPLOY_CONFIG_MAPS=${DEPLOY_CONFIG_MAPS}, so deploying .extraConfigmaps"
+      fi
+    # проверяем, NS старый или новый
+    - >
+      OLD_PG_SERVICE=$(kubectl get service nextbi-pg-${NS} -n ${NS} --ignore-not-found) ;
+      if [[ "$NS" != "nextbi" && -n ${OLD_PG_SERVICE} ]]; then
+        echo "${NS} has old setup. Will add '--set global.oldStand=true' to HELM_EXTRA_ARGS...";
+        export HELM_EXTRA_ARGS="--set global.oldStand=true ${HELM_EXTRA_ARGS}";
+      fi
+    - echo "${MAGENTA}HELM_EXTRA_ARGS=${HELM_EXTRA_ARGS}${CLEAR}";
+    - |
+      HELM_FINAL_FLAGS="./ --namespace ${K8S_NS} --create-namespace -f ./values.yaml"
+      [[ -f values-ugly-devops.yaml ]] && HELM_FINAL_FLAGS="${HELM_FINAL_FLAGS} -f values-ugly-devops.yaml" || true
+      [[ -f values-all-dev.yaml ]] && HELM_FINAL_FLAGS="${HELM_FINAL_FLAGS} -f values-all-dev.yaml" || true
+      [[ -f values-cluster-${CLUSTER}.yaml ]] && HELM_FINAL_FLAGS="${HELM_FINAL_FLAGS} -f values-cluster-${CLUSTER}.yaml" || true
+      [[ -f values-${NS}.yaml ]] && HELM_FINAL_FLAGS="${HELM_FINAL_FLAGS} -f values-${NS}.yaml" || true
+      HELM_FINAL_FLAGS="${HELM_FINAL_FLAGS} --set global.isDev=${IS_DEV_FLAG} --set global.fqdn=${K8S_FQDN} --set global.misc.grafanaFQDN=grafana.${K8S_FULL_DOMAIN} --set global.image.pullPolicy=Always ${HELM_EXTRA_ARGS}"
+    - echo $HELM_FINAL_FLAGS
+    - >
+      [[ -f values-dev-all.yaml ]] && sed -i "s/\${NS}/${K8S_NS}/g" values-dev-all.yaml || true
+    - helm template --debug ${APP} ${HELM_FINAL_FLAGS} > ${CI_PROJECT_DIR}/helm-template.yaml 
+    - export HELM_REASSIGN_RESOURCES_FROM_ATOMIC_RELEASE_RENDERED_MANIFEST=${CI_PROJECT_DIR}/helm-template.yaml
+    - !reference [.templates, helm_reassign_resources_from_atomic_release]
+    - |
+      helm upgrade --install --wait --timeout ${HELM_TIMEOUT}m ${APP} ${HELM_FINAL_FLAGS} && export HELM_EXIT_CODE=$? || export HELM_EXIT_CODE=$?
+      if [[ "${HELM_EXIT_CODE}" != "0" && "${CLUSTER}" == "k8s_dev" ]]; then
+        echo "${RED}Неудачная установка на кластере ${CYAN}k8s_dev${CLEAR}
+        Пробуем переустановить с предварительным удалением сущностей:"
+        kubectl delete -f ${CI_PROJECT_DIR}/helm-template.yaml -n ${K8S_NS}
+        helm upgrade --install --wait --timeout ${HELM_TIMEOUT}m ${APP} ${HELM_FINAL_FLAGS} && export HELM_EXIT_CODE=$? || export HELM_EXIT_CODE=$?
+      fi
+    - |
+      [[ -n "$LABEL_NS_AS_STAND" ]] && kubectl label ns ${K8S_NS} stand="true" --overwrite || true
+    - |
+      if [[ "${HELM_EXIT_CODE}" == "0" ]]; then
+        echo "${GREEN}Успешный деплой на стенд $NS: https://${K8S_FQDN}${CLEAR}"
+        exit 0
+      fi
+    # при неуспехе
+    - !reference [.templates, kubectl_show_error]
+    - exit 1
+
+  rules:
+    - if: $DEPLOY && $DEPLOY != "false"
+    - when: manual
+      allow_failure: true
+  artifacts:
+    expire_in: 3 days
+    when: always
+    paths:
+      - helm-template.yaml 
+
+
+.kaniko:
+  stage: build
+  needs: []
+  image:
+    name: ${NEXUS_URL}/kaniko-project/kaniko-debug-git-master:v1.23.2
+    entrypoint: [""]
+  variables:
+    DOCKERFILE_PATH: "Dockerfile"
+    IMAGE_TAIL_SUBNAME: ""
+    CONTEXT: ""
+    BUILD_ARGS: ""
+    LABELS: "--label app=nextbi"
+    VERSION: ""
+    CONTAINER_PATH: ""
+    JAVA_CONTAINER_VERSION: "${JAVA_VERSION}"
+    GRADLE_CONTAINER_VERSION: "${GRADLE_VERSION}"
+    KANIKO_SNAPSHOT_MODE: time
+    VARIABLES_TO_BUILD_ARGS_DEFAULT: NEXUS_URL CI_PROJECT_NAME K8S_ENVIRONMENT #список имен переменных через пробел
+    VARIABLES_TO_BUILD_ARGS: ""
+    VARIABLES_TO_LABEL_DEFAULT: CI_COMMIT_REF_NAME CI_COMMIT_SHA CI_COMMIT_TIMESTAMP CI_COMMIT_TAG COMMIT_AUTHOR CI_PIPELINE_URL #CI_COMMIT_TITLE
+    VARIABLES_TO_LABEL: ""
+  script:
+    - |
+      echo "${MAGENTA}${IMAGE_TAIL_SUBNAME:+IMAGE_TAIL_SUBNAME is set to $IMAGE_TAIL_SUBNAME
+      }Building image for ${CI_COMMIT_REF_SLUG}${CLEAR}"
+      rm /var/spool/mail
+      mv /var/mail /var/spool/mail
+      ln -s /var/spool/mail /var/mail
+    - !reference [.templates, kaniko_login]
+    - !reference [.templates, calc_version_job]
+    # - !reference [.templates, git_submodule_update] # Возможно, что-то отвалится. Кандидат на удаление. Сабмодули - плохо.
+
+    # ${VERSION} берется из !reference [.templates, calc_version_job]
+    # Если CI_COMMIT_SHORT_SHA уже существует в тег-листе - перетегиваем его, а не собираем
+    - !reference [.templates, is_tag_exists]
+    - DESTINATION_TAGS="${CI_COMMIT_TAG} ${CI_COMMIT_SHORT_SHA} ${VERSION} ${VERSION_SAFE} ${CI_COMMIT_REF_SLUG} ${CI_COMMIT_TAG:+release-${CI_COMMIT_TAG}}" ;
+    - |
+      echo "${IS_TAG_EXISTS}";
+      if [[ -n "${IS_TAG_EXISTS}"  && "${FORCE_REBUILD}" == "false" ]] ;
+      then
+        echo "${YELLOW}Обнаружен уже собранный контейнер с тегом ${CI_COMMIT_SHORT_SHA}. 
+        Так как переменная ${MAGENTA}FORCE_REBUILD ${YELLOW}не выставлена в 'true', то контейнер не будет собираться - вместо этого мы скопируем старый образ с новыми тегами.${CLEAR}"        
+        
+        curl -s -k  -H "Accept: application/vnd.docker.distribution.manifest.v2+json" https://${NEXUS_URL}/v2/${CHECK_IMAGE_PARTIAL_PATH}/manifests/${CI_COMMIT_SHORT_SHA} > manifest.json
+        for D in $DESTINATION_TAGS ; do
+          curl -X PUT -s --fail --show-error -k -u "${NEXUS_USER}:${NEXUS_PASSWORD}" -H  "Content-Type: application/vnd.docker.distribution.manifest.v2+json" -d @manifest.json "https://${NEXUS_URL}/v2/${CHECK_IMAGE_PARTIAL_PATH}/manifests/${D}"
+        done;
+
+        echo "${YELLOW}Образ ${CONTAINER_COMPUTED_IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} ретегнут следующими тегами:"
+        for D in $DESTINATION_TAGS ; do
+          echo "${CONTAINER_COMPUTED_IMAGE_NAME}:${D}";
+        done;
+
+        exit 0 ;
+      fi;
+
+      export DESTINATIONS="" ;
+      for D in $DESTINATION_TAGS ; do
+        DESTINATIONS="${DESTINATIONS} --destination ${CONTAINER_COMPUTED_IMAGE_NAME}:${D}"
+      done
+      if [[ -n ${CI_COMMIT_TAG} ]]; then
+        export K8S_ENVIRONMENT="production" ;
+      elif [[ "$(echo "${CI_COMMIT_REF_SLUG}" | grep -E '^(release)\/.+$')" ]]; then
+        export K8S_ENVIRONMENT="staging" ;
+      elif [[ "$(echo "${CI_COMMIT_REF_SLUG}" | grep -E '^(feature|bugfix)\/.+$')" || "${CI_COMMIT_REF_NAME}" == "${CI_DEFAULT_BRANCH}" ]]; then
+        export K8S_ENVIRONMENT="development" ;
+      fi ;
+
+    - |
+      for VAR in ${VARIABLES_TO_BUILD_ARGS} ${VARIABLES_TO_BUILD_ARGS_DEFAULT}; do
+        VALUE="$(eval echo "$"$(echo "${VAR}"))"
+        [[ -n "${VALUE}" ]] && BUILD_ARGS="--build-arg ${VAR}=${VALUE} ${BUILD_ARGS}" || true;
+      done ;
+    - |
+      export  COMMIT_AUTHOR="$(echo -n ${CI_COMMIT_AUTHOR} | cut -d' ' -f1)_$(echo -n ${CI_COMMIT_AUTHOR} | cut -d' ' -f2)"
+      for VAR in ${VARIABLES_TO_LABEL} ${VARIABLES_TO_LABEL_DEFAULT}; do
+        VALUE="$(eval echo "$"$(echo "${VAR}"))"
+        VAR="${VAR,,}"
+        VAR="${VAR//_/-}"
+        VAR="${VAR//ci-/}"
+        [[ -n "${VALUE}" ]] && LABELS="--label ${VAR}=${VALUE} ${LABELS}" || true;
+      done ;
+    - |
+      echo "executing: ${MAGENTA}/kaniko/executor 
+                       --force ${KANIKO_TARGET:+--target ${KANIKO_TARGET}}
+                       --snapshot-mode=${KANIKO_SNAPSHOT_MODE} 
+                       --context $CI_PROJECT_DIR/${CONTEXT} 
+                       --insecure 
+                       --skip-tls-verify
+                       --dockerfile ${DOCKERFILE_PATH} 
+                       $(echo -n "${DESTINATIONS}") 
+                       $(echo -n "${BUILD_ARGS}") 
+                       $(echo -n "${LABELS}")${CLEAR}"
+    - /kaniko/executor --force ${KANIKO_TARGET:+--target ${KANIKO_TARGET}} --snapshot-mode=${KANIKO_SNAPSHOT_MODE} --context $CI_PROJECT_DIR/${CONTEXT} --insecure --skip-tls-verify --dockerfile ${DOCKERFILE_PATH} $(echo -n "${DESTINATIONS}") $(echo -n "${BUILD_ARGS}") $(echo -n "${LABELS}")
+
+.kaniko-build-java:
+  extends: .kaniko
+  retry: 1
+  cache: { }
+  variables:
+    VARIABLES_TO_BUILD_ARGS_DEFAULT: NEXUS_URL CI_PROJECT_NAME K8S_ENVIRONMENT JAVA_CONTAINER_VERSION GRADLE_CONTAINER_VERSION LIB_VERSION CI_COMMIT_REF_SLUG CI_COMMIT_REF_NAME
+    VARIABLES_TO_BUILD_ARGS: ""
+  script:
+    - eval $(grep libVersion gradle.properties)
+    - export LIB_VERSION=$libVersion
+    - !reference [.templates, build_dockerfile_from_template]
+    - !reference [.kaniko, script]
+  artifacts:
+    paths:
+    - Dockerfile
+    expire_in: 1 day
+    when: always
+
+### Пушит собранный Helm-chart в nexus. Нужно для релизного процесса.
+
+## developer-helpers/dev-scripts
+## В нужные проект добавьте в .gitlab-ci.yml:
+# run dev-tests:
+#   extends:
+#   - .additional_tests
+#   variables:
+#     TEST_NAMES: db-consistency-clickhouse # в строчку через пробел все тесты
+
+.additional_tests:
+  stage: deploy
+  variables:
+    TEST_REF: develop
+    NS: ${NS}
+  needs:
+    - job: deploy
+  trigger:
+    project: developer-helpers/dev-scripts
+    branch: ${TEST_REF}
+    strategy: depend
+  rules:
+  - if: '$TEST == "true" && $NS != "none"'
+    when: on_success
+  - when: never
+    
+.publishHelm:
+  stage: build
+  needs: []
+  dependencies: []
+  cache: {}
+  tags:
+    - build-docker
+  image: ${HELM_IMAGE}
+  variables:
+    APP: ${CI_PROJECT_NAME}
+  script:
+    - !reference [.templates, calc_version_job]
+    - !reference [.templates, helm_repo_add_nextbi]
+    - !reference [.templates, download_and_change_chart]
+    - cat ./chart/Chart.yaml
+    - cd chart
+    - helm package . || (cat values.yaml && exit 1)
+    - curl -ik -u "$NEXUS_USER:$NEXUS_PASSWORD" "https://nexus.nextbi.ru/repository/helm/" --upload-file "$(ls | grep .tgz)"
+    # Если затеганы - собираемся еще и под этим тегом
+    - |
+      if [[ "$CI_COMMIT_TAG" ]]; then
+        rm -Rf $(ls | grep .tgz)
+        yq -i ".appVersion |= \"${CI_COMMIT_TAG}\"" ./Chart.yaml
+        yq -i ".version |= \"${CI_COMMIT_TAG}\"" ./Chart.yaml
+        yq -i ".image.tag |= \"release-${CI_COMMIT_TAG}\"" ./values.yaml
+        helm package .
+        curl -ik -u "$NEXUS_USER:$NEXUS_PASSWORD" "https://nexus.nextbi.ru/repository/helm/" --upload-file "$(ls | grep .tgz)"
+        echo "${GREEN}Чарт собран с версией ${MAGENTA}${CI_COMMIT_TAG}"
+      fi
+    - echo "${GREEN}Чарт собран с версией ${MAGENTA}${VERSION_NUM}"
+  rules:
+    - if: $ONLY_DEPLOY == "true"
+      when: never
+    - if: $CI_COMMIT_TAG
+    - if: $PUBLISH_HELM == "true"
+    - when: never
+
+### Пушит собранный релиз в update-repository. Нужно для релизного процесса.
+#Update-repository push:
+#  extends:
+#  - .update-repository push
+.update-repository push:
+  image:  ${NEXUS_URL}/curlimages/curl:latest
+  stage: build
+  needs:
+  - job: build
+    artifacts: false
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: on_success
+    - when: never
+  script:
+    - |
+      COMPONENT_NAME="$(basename ${REGISTRY_IMAGE})/${CI_PROJECT_NAME}${IMAGE_TAIL_SUBNAME:+/}${IMAGE_TAIL_SUBNAME}"
+      echo "${MAGENTA}
+        platformVersion: \"${CI_COMMIT_TAG}\"
+        componentName: \"${COMPONENT_NAME}\"
+        componentVersion: \"${CI_COMMIT_SHORT_SHA}\"
+        dockerImage: \"${REGISTRY_IMAGE}/${CI_PROJECT_NAME}${IMAGE_TAIL_SUBNAME:+/}${IMAGE_TAIL_SUBNAME}:release-${CI_COMMIT_TAG}\"
+      ${CLEAR}"
+    - | 
+      curl -X POST \
+        --insecure --silent --fail \
+        --header "Content-Type: application/json" \
+        --data "{ \
+          \"platformVersion\": \"${CI_COMMIT_TAG}\", \
+          \"componentName\": \"${COMPONENT_NAME}\", \
+          \"componentVersion\": \"${CI_COMMIT_SHORT_SHA}\", \
+          \"dockerImage\": \"${REGISTRY_IMAGE}/${CI_PROJECT_NAME}${IMAGE_TAIL_SUBNAME:+/}${IMAGE_TAIL_SUBNAME}:release-${CI_COMMIT_TAG}\" \
+        }" \
+        "${UPDATE_SERVICE_URL_COMPONENTS}"
+
+.update-confluence:
+  stage: .post
+  tags:
+    - build-docker
+  image: ${NEXUS_URL}/nextbi-misc/trivia/update-confluence:develop
+  variables:
+    JIRA_USERNAME: a.pivovarov # при изменении JIRA_USERNAME так же поменять JIRA_PASSWORD в Gitlab -> Admin -> Settings -> CI/CD -> Variables
+    CONFLUENCE_SERVER: http://cf.two.nextbi.ru
+    UPDATE_CONFLUENCE_PAGE_TRUTH_SOURCES: ${CI_JOB_URL} # все ссылки через пробел
+#    UPDATE_CONFLUENCE_PAGE_PAGE_ID: "188460554"
+  script:
+      - echo "${COMMAND}"
+      - /usr/local/bin/python /app/main.py --page-updater ${COMMAND} # подробности в http://gitlab-master.nextbi.ru/devops/iac/trivia/-/tree/develop/docker-images/update-confluence
+
+### если хочется авто-коммитить апдейт версии либы в зависимые репы, добавьте в свой репозиторий конструкцию
+# Update linked repositories:
+#   extends:
+#   -.update linked repositories
+#   variables:
+#     LIBRARY_GROUP: org.nextbi.group
+#     LIBRARY_NAME: $CI_PROJECT_NAME
+### И установите нужные переменные из этой джобы
+### В качестве версии используется значение libVersion из ./gradle.properties
+.update linked repositories:
+  stage: deploy
+  image: ${HELM_IMAGE}
+  needs:
+  - build  
+  script:
+    ### Если понадобится автоподъем версий
+    - !reference [.templates, calc_version_job]
+    - >
+      [[ -f "build.gradle.kts" ]] && sed -i "s/${JAVA_VERSION_KEYWORD}=.*/${JAVA_VERSION_KEYWORD}=${VERSION}/g" ${JAVA_VERSION_FILE} || true
+    - |
+      export GITLAB_API_TOKEN=${GITLAB_API_TOKEN_BOT}
+      export SOMETHING_WRONG_LIST=""
+    - |
+      PROJECTS_JSON=$(curl --insecure --silent --fail --show-error --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" "${CI_API_V4_URL}/groups/${GROUP_ID}/projects?per_page=100" )
+      for PROJECT_ID in $(echo ${PROJECTS_JSON} | jq '.[].id') ${ADDITIONAL_PROJECTS_ID} ; do
+        export PASS_LOOP=false
+        echo "===========================> ${PROJECT_ID}"
+        BUILD_GRADLE_JSON=$(curl --insecure --silent --fail  --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" "${CI_API_V4_URL}/projects/${PROJECT_ID}/repository/files/build.gradle?ref=${TARGET_BRANCH}") \
+          ||  { RESPONSE=$(curl --insecure --silent --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" "${CI_API_V4_URL}/projects/${PROJECT_ID}/repository/files/build.gradle?ref=${TARGET_BRANCH}") \
+                && [[ "$(echo ${RESPONSE} | jq -r '.message' )" == "404 File Not Found" ]] \
+                && echo "build.gradle не найден" \
+                && PASS_LOOP=true ;\
+              }\
+          ||  { echo "Что-то пошло не так с ${CI_API_V4_URL}/projects/${PROJECT_ID}/repository/files/build.gradle?ref=${TARGET_BRANCH}:" \
+                  && echo $RESPONSE \
+                  && echo "Ссылка на репозиторий: $(curl --insecure --silent --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" "${CI_API_V4_URL}/projects/${PROJECT_ID}" | jq -r '.web_url')" \
+                  && SOMETHING_WRONG_LIST="${SOMETHING_WRONG_LIST} ${CI_API_V4_URL}/projects/${PROJECT_ID}/repository/files/build.gradle?ref=${TARGET_BRANCH}"\
+                  && PASS_LOOP=true ; \
+               } 
+        [[ "${PASS_LOOP}" == "true" ]] && continue || true
+        if [[ -n ${BUILD_GRADLE_JSON} ]] ; then
+          echo "Найден build.gradle в репозитории с ID: $PROJECT_ID"
+          echo ${BUILD_GRADLE_JSON} | jq -r '.content' | base64 -d > raw_file
+          if [[ "$(cat raw_file)" =~ $REGEX_TO_SEARCH_IN_GRADLE ]]; then
+            echo "Найдена зависимость по маске $REGEX_TO_SEARCH_IN_GRADLE"
+            MATCH_PROJECTS_IDS="${MATCH_PROJECTS_IDS} ${PROJECT_ID}"
+            eval $(grep ${JAVA_VERSION_KEYWORD} ${JAVA_VERSION_FILE})
+            cat raw_file | sed  "s/${LIBRARY_GROUP}:${LIBRARY_NAME}:[0-9]*.[0-9]*.[0-9]*/${LIBRARY_GROUP}:${LIBRARY_NAME}:${!JAVA_VERSION_KEYWORD}/" > new_file
+            if [[ "$(cat raw_file)" != "$(cat new_file)" ]] ; then
+              echo "Вносим изменения в репозиторий с ID: ${PROJECT_ID}"
+              curl --request PUT \
+                  --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
+                  --header "Content-Type: application/json" \
+                  --data "{\"branch\": \"${TARGET_BRANCH}\", \"author_email\": \"${GITLAB_USER_EMAIL}\", \"author_name\": \"${GITLAB_USER_NAME}\",\"content\": \"$(cat new_file | base64 -w 0)\", \"commit_message\": \"$( echo -n ${CI_COMMIT_MESSAGE} | cut -d' ' -f1) ${COMMIT_MESSAGE_PART} ${!JAVA_VERSION_KEYWORD}\", \"encoding\": \"base64\"}" \
+                  --url "${CI_API_V4_URL}/projects/${PROJECT_ID}/repository/files/build.gradle"
+            else
+              echo "изменения не нужны - версии совпадают"
+            fi
+          rm -f raw_file
+          rm -f new_file
+          fi
+        fi
+      done
+    - |
+      export GITLAB_START_PIPES_PROJECT_IDS=${MATCH_PROJECTS_IDS}
+      export GITLAB_START_PIPES_TARGET_REF=${TARGET_BRANCH}
+      export GITLAB_CHECK_PIPES_TARGET_REF=${TARGET_BRANCH}
+      export GITLAB_CHECK_PIPES_PROJECT_IDS=${MATCH_PROJECTS_IDS}
+    - !reference [.templates, gitlab_start_pipes]
+    - !reference [.templates, gitlab_check_pipes]
+    - |
+      if [[ -n "${SOMETHING_WRONG_LIST}" ]]; then
+        echo "ЧТО-ТО ПОШЛО НЕ ТАК с этими репозиториями (подробности смотрите в начале джобы):";
+        for REPO_LINK in ${SOMETHING_WRONG_LIST}; do echo ${REPO_LINK} ; done ;
+        exit 1 ;
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      when: manual
+      allow_failure: true
+    - when: never
+  variables:
+    COMMIT_MESSAGE_PART: "update $CI_PROJECT_NAME version to "
+    REGEX_TO_SEARCH_IN_GRADLE: ^.*$LIBRARY_GROUP\:$LIBRARY_NAME.*$
+    TARGET_BRANCH: "develop"
+    GROUP_ID: "22" # dataflows
+    ADDITIONAL_PROJECTS_ID: "" # через пробел задаем id дополнительных проектов, которые не входят в группу.
+    LIBRARY_GROUP: org.nextbi.dataflow
+    LIBRARY_NAME: ${CI_PROJECT_NAME}
